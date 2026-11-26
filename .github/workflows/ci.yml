@@ -206,7 +206,7 @@ jobs:
 
       - name: Ejecutar tests
         shell: bash
-        run: mvn -B test | tee maven.log
+        run: mvn -B test 2>&1 | tee maven.log
 
       # JaCoCo no rompe la build si no sabe instrumentar una version de Java:
       # solo imprime una excepcion. Este paso convierte ese aviso en un fallo.
