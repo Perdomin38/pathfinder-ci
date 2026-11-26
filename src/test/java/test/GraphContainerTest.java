@@ -45,6 +45,28 @@ public class GraphContainerTest {
 		);
 	}
 
+	@Test
+	void testShortestPathPrefersLighterRoute() {
+		// De B a D: B-C-D pesa 2+1 = 3, mas ligero que B-A-D (1+4 = 5)
+		assertEquals(3.0, graphContainer.pathWeightBetween("B", "D"));
+		assertEquals(java.util.List.of("B", "C", "D"), graphContainer.shortestPathBetween("B", "D"));
+	}
+
+	@Test
+	void testWeightWithUnknownVertex() {
+		assertThrows(IllegalArgumentException.class, () -> graphContainer.pathWeightBetween("Z", "A"));
+		assertThrows(IllegalArgumentException.class, () -> graphContainer.shortestPathBetween("Z", "A"));
+	}
+
+	@Test
+	void testDisconnectedVertices() {
+		Graph<String, DefaultEdge> graph = mockGraph();
+		graph.addVertex("X");
+		GraphContainer container = new GraphContainer(graph);
+		assertThrows(IllegalArgumentException.class, () -> container.shortestPathBetween("A", "X"));
+		assertThrows(IllegalArgumentException.class, () -> container.pathWeightBetween("A", "X"));
+	}
+
 	private GraphLoader mockGraphLoader() throws IOException {
 		GraphLoader graphLoader = mock(GraphLoader.class);
 		when(graphLoader.load()).thenReturn(new GraphContainer(mockGraph()));
