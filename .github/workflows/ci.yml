@@ -205,4 +205,17 @@ jobs:
           cache: maven
 
       - name: Ejecutar tests
-        run: mvn -B test
+        shell: bash
+        run: mvn -B test 2>&1 | tee maven.log
+
+      # JaCoCo no rompe la build si no sabe instrumentar una version de Java:
+      # solo imprime una excepcion. Este paso convierte ese aviso en un fallo.
+      - name: Comprobar que JaCoCo instrumenta sin errores
+        shell: bash
+        run: |
+          if grep -q "Error while instrumenting" maven.log; then
+            grep -m1 -A2 "Error while instrumenting" maven.log
+            echo "::error::JaCoCo no soporta JDK ${{ matrix.java }}"
+            exit 1
+          fi
+          echo "JaCoCo OK con JDK ${{ matrix.java }}"
