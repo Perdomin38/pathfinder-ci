@@ -1,0 +1,208 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# El token del workflow solo necesita leer el repositorio
+permissions:
+  contents: read
+
+# Si llega un push nuevo a la misma rama, se cancela la ejecucion anterior
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COVERAGE_THRESHOLD: 80
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Preparacion: valida el proyecto y extrae las coordenadas Maven (outputs)
+  # ---------------------------------------------------------------------------
+  archetype:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      group: ${{ steps.coords.outputs.group }}
+      artifact: ${{ steps.coords.outputs.artifact }}
+      version: ${{ steps.coords.outputs.version }}
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Verificar que existe pom.xml
+        run: |
+          if [ -f pom.xml ]; then
+            echo "pom.xml found"
+          else
+            echo "Error: pom.xml not found."
+            exit 1
+          fi
+
+      - name: Extraer coordenadas Maven
+        id: coords
+        run: |
+          GROUP=$(mvn -B help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+          ARTIFACT=$(mvn -B help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          VERSION=$(mvn -B help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "group=${GROUP}" >> "$GITHUB_OUTPUT"
+          echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Coordenadas: ${GROUP}:${ARTIFACT}:${VERSION}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Construccion, pruebas, empaquetado y reporte de cobertura (artefactos)
+  # ---------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-22.04
+    needs: archetype
+    timeout-minutes: 15
+    outputs:
+      jar: ${{ steps.jar.outputs.name }}
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Restaurar cache de dependencias
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: >-
+            maven-dependencies-${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-dependencies-${{ needs.archetype.outputs.artifact }}-
+
+      # El umbral lo decide el job coverage-check: aqui JaCoCo no corta la build
+      # para que el reporte se suba siempre y pueda diagnosticarse.
+      - name: Construir y empaquetar el proyecto
+        run: mvn -B clean compile test package verify -Djacoco.haltOnFailure=false
+
+      - name: Localizar el JAR generado
+        id: jar
+        run: |
+          JAR="${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}.jar"
+          test -f "target/${JAR}" || { echo "Error: target/${JAR} not found."; exit 1; }
+          echo "name=${JAR}" >> "$GITHUB_OUTPUT"
+          ls -l target/*.jar
+
+      - name: Guardar reporte de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/
+          retention-days: 7
+
+      # R3: el JAR solo se publica como artefacto en la rama principal
+      - name: Guardar JAR (solo en master)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}
+          path: target/${{ steps.jar.outputs.name }}
+          retention-days: 7
+
+      # Diagnostico: si falla algun test, se guardan los informes de Surefire
+      - name: Guardar informes de tests (solo si falla)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3. Puerta de calidad: cobertura minima del 80 %
+  # ---------------------------------------------------------------------------
+  coverage-check:
+    runs-on: ubuntu-22.04
+    needs: [archetype, build]
+    timeout-minutes: 10
+    outputs:
+      coverage: ${{ steps.check.outputs.coverage }}
+    steps:
+      - name: Configurar JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Descargar reporte de cobertura
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: ./reports
+
+      - name: Verificar el umbral de cobertura
+        id: check
+        run: |
+          python3 - <<'EOF'
+          import os, sys, xml.etree.ElementTree as ET
+          root = ET.parse("reports/jacoco.xml").getroot()
+          threshold = float(os.environ["COVERAGE_THRESHOLD"])
+          # Los contadores hijos directos de <report> son los totales del proyecto
+          pct = {}
+          for c in root.findall("counter"):
+              m, cv = int(c.get("missed")), int(c.get("covered"))
+              pct[c.get("type")] = 100.0 * cv / (m + cv) if m + cv else 100.0
+          line, instr = round(pct["LINE"], 2), round(pct["INSTRUCTION"], 2)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"coverage={line}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("| Metrica | Cobertura | Umbral |\n|---|---|---|\n")
+              for k in ("LINE", "INSTRUCTION", "BRANCH", "METHOD"):
+                  s.write(f"| {k} | {pct[k]:.2f} % | {threshold:.0f} % |\n")
+          print(f"Line coverage: {line}%  |  Instruction coverage: {instr}%")
+          if line < threshold or instr < threshold:
+              print(f"::error::Coverage below threshold: {min(line, instr)}% < {threshold:.0f}%")
+              sys.exit(1)
+          print(f"Coverage meets the threshold: {min(line, instr)}% >= {threshold:.0f}%")
+          EOF
+
+      # R3: paso que solo se ejecuta en pull requests
+      - name: Nota de revision (solo en pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "PR #${{ github.event.pull_request.number }}: cobertura de lineas ${{ steps.check.outputs.coverage }} %" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # R2. Matriz de compatibilidad: sistemas operativos x versiones de Java
+  # ---------------------------------------------------------------------------
+  compatibility:
+    runs-on: ${{ matrix.os }}
+    needs: archetype
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, windows-2022]
+        java: ['21', '25']
+    name: test (${{ matrix.os }}, JDK ${{ matrix.java }})
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Ejecutar tests
+        run: mvn -B test
